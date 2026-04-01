@@ -2,7 +2,9 @@
 
 **TurboQuant 4-bit KV cache with full CUDA support for PrismML's 1-bit llama.cpp fork**
 
-Fork of [PrismML/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) adding:
+![biturbo running on GTX 1660 Ti](biturbo.png)
+
+Extremely alpha and buggy fork of [PrismML/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) adding:
 1. dp4a integer matmul kernel for Q1_0_g128 on non-RTX Turing GPUs
 2. TBQ4_0 (TurboQuant 4-bit) KV cache quantization with CUDA quantize + dequantize
 3. Fast Walsh-Hadamard Transform (FWHT) for O(n log n) rotation instead of O(n^2) Householder
