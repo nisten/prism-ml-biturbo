@@ -193,7 +193,22 @@ struct cli_context {
         inputs.enable_thinking       = (reasoning_budget != 0) && chat_params.enable_thinking;
 
         // Apply chat template to the list of messages
-        return common_chat_templates_apply(chat_params.tmpls.get(), inputs);
+        auto result = common_chat_templates_apply(chat_params.tmpls.get(), inputs);
+
+        // Force-close thinking block if reasoning is disabled.
+        // The template post-handler only catches turn 1 (when prompt ends with "<think>\n").
+        // On turn 2+, the prompt ends with "<|im_start|>assistant\n" and thinking is not closed.
+        // Fix: inject <think>\n</think>\n so the model sees a closed thinking block and skips it.
+        if (reasoning_budget == 0 && !result.prompt.empty()) {
+            const std::string asst_suffix = "<|im_start|>assistant\n";
+            if (result.prompt.size() >= asst_suffix.size() &&
+                result.prompt.compare(result.prompt.size() - asst_suffix.size(),
+                                      asst_suffix.size(), asst_suffix) == 0) {
+                result.prompt += "<think>\n</think>\n";
+            }
+        }
+
+        return result;
     }
 };
 
