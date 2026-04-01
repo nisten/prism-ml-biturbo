@@ -188,6 +188,23 @@ typedef struct {
 } block_q1_0_g128;
 static_assert(sizeof(block_q1_0_g128) == sizeof(ggml_half) + QK1_0_g128 / 8, "wrong q1_0_g128 block size/padding");
 
+// TurboQuant blocks (KV cache compression via random rotation + Lloyd-Max quantization)
+// Block size = QK_K = 256 elements
+
+// TBQ3_0: 3.0625 bits per weight
+typedef struct {
+    uint8_t qs[256 * 3 / 8];  // 96 bytes: 3 bits per value
+    ggml_half d;               // 2 bytes: FP16 norm (scale)
+} block_tbq3_0;
+static_assert(sizeof(block_tbq3_0) == sizeof(ggml_half) + 256 * 3 / 8, "wrong tbq3_0 block size/padding");
+
+// TBQ4_0: 4.0625 bits per weight
+typedef struct {
+    uint8_t qs[256 / 2];      // 128 bytes: 4 bits per value (nibble-packed)
+    ggml_half d;               // 2 bytes: FP16 norm (scale)
+} block_tbq4_0;
+static_assert(sizeof(block_tbq4_0) == sizeof(ggml_half) + 256 / 2, "wrong tbq4_0 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta

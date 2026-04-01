@@ -429,7 +429,9 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_Q1_0    = 40,
         GGML_TYPE_Q1_0_g128 = 41,
-        GGML_TYPE_COUNT   = 42,
+        GGML_TYPE_TBQ3_0  = 42, // TurboQuant 3-bit KV cache (98 bytes per 256 elements)
+        GGML_TYPE_TBQ4_0  = 43, // TurboQuant 4-bit KV cache (130 bytes per 256 elements)
+        GGML_TYPE_COUNT   = 44,
     };
 
     // precision
@@ -467,6 +469,8 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0_g128 = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_TBQ3_0   = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_TBQ4_0   = 29, // except 1d tensors
     };
 
     // available tensor operations:

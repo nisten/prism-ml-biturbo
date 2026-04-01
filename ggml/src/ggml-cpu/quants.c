@@ -1292,3 +1292,49 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
+
+// TurboQuant vec_dot implementations (dequant-then-dot approach for flash attention)
+
+void ggml_vec_dot_tbq3_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const int nb = n / QK_K;
+    float * tmp = (float *)malloc(n * sizeof(float));
+    dequantize_row_tbq3_0((const block_tbq3_0 *)vx, tmp, n);
+
+    const block_q8_K * GGML_RESTRICT y = (const block_q8_K *)vy;
+    float sumf = 0.0f;
+    int64_t idx = 0;
+    for (int i = 0; i < nb; i++) {
+        const float d = y[i].d;
+        for (int j = 0; j < QK_K; j++) {
+            sumf += tmp[idx] * (d * y[i].qs[j]);
+            idx++;
+        }
+    }
+    free(tmp);
+    *s = sumf;
+}
+
+void ggml_vec_dot_tbq4_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const int nb = n / QK_K;
+    float * tmp = (float *)malloc(n * sizeof(float));
+    dequantize_row_tbq4_0((const block_tbq4_0 *)vx, tmp, n);
+
+    const block_q8_K * GGML_RESTRICT y = (const block_q8_K *)vy;
+    float sumf = 0.0f;
+    int64_t idx = 0;
+    for (int i = 0; i < nb; i++) {
+        const float d = y[i].d;
+        for (int j = 0; j < QK_K; j++) {
+            sumf += tmp[idx] * (d * y[i].qs[j]);
+            idx++;
+        }
+    }
+    free(tmp);
+    *s = sumf;
+}

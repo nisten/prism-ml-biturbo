@@ -1739,10 +1739,41 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
                float   kq_scale,
                  int   il) const {
+    const bool k_is_tbq = k->type == GGML_TYPE_TBQ3_0 || k->type == GGML_TYPE_TBQ4_0;
+    const bool v_is_tbq = v->type == GGML_TYPE_TBQ3_0 || v->type == GGML_TYPE_TBQ4_0;
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    // CPU DUP kernel only supports quantized→F32, not quantized→F16
+    // Flash attention will handle F32→F16 conversion internally if needed
+    const enum ggml_type tbq_attn_type = GGML_TYPE_F32;
+
+    // v_trans must be computed BEFORE TBQ cast/reshape changes tensor layout
     const bool v_trans = v->nb[1] > v->nb[2];
 
-    // split the batch into streams if needed
-    const auto n_stream = k->ne[3];
+    // n_stream must be computed BEFORE TBQ cast/reshape changes tensor dims
+    // TBQ tensors are 3D (ne[2] = n_seq), non-TBQ are 4D (ne[3] = n_seq)
+    const auto n_stream = k_is_tbq ? k->ne[2] : (v_is_tbq ? v->ne[2] : k->ne[3]);
+
+    // TBQ types: cast (dequantize) and reshape from 3D to 4D before permute
+    if (k_is_tbq) {
+        const int64_t n_head_kv = hparams.n_head_kv(il);
+        const int64_t n_embd_k_gqa = k->ne[0];
+        GGML_ASSERT(n_head_kv > 0);
+        GGML_ASSERT(n_embd_k_gqa % n_head_kv == 0);
+        k = ggml_cast(ctx0, k, tbq_attn_type);
+        cb(k, use_flash_attn ? "k_tbq_f16" : "k_tbq_f32", il);
+        k = ggml_reshape_4d(ctx0, k, n_embd_k_gqa / n_head_kv, n_head_kv, k->ne[1], k->ne[2]);
+        cb(k, "k_tbq_reshaped", il);
+    }
+    if (v_is_tbq) {
+        const int64_t n_head_kv = hparams.n_head_kv(il);
+        const int64_t n_embd_v_gqa = v->ne[0];
+        GGML_ASSERT(n_head_kv > 0);
+        GGML_ASSERT(n_embd_v_gqa % n_head_kv == 0);
+        v = ggml_cast(ctx0, v, tbq_attn_type);
+        cb(v, use_flash_attn ? "v_tbq_f16" : "v_tbq_f32", il);
+        v = ggml_reshape_4d(ctx0, v, n_embd_v_gqa / n_head_kv, n_head_kv, v->ne[1], v->ne[2]);
+        cb(v, "v_tbq_reshaped", il);
+    }
 
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
 
@@ -1752,7 +1783,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
