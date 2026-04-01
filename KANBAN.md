@@ -13,12 +13,19 @@ Status: works on one GPU (GTX 1660 Ti, sm_75). Untested elsewhere.
 
 ## Critical Safety Rules
 
-### 1. NEVER omit -DCMAKE_CUDA_ARCHITECTURES=XX
+### 1. If you get garbage output, pin your CUDA architecture
 
-CUDA 13.x default arch auto-detection produces BROKEN PTX = silent garbage output.
+Some CUDA 13.x versions have broken default arch auto-detection (produces wrong PTX).
+The default build should work for most people:
 
 ```bash
-cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+```
+
+If you get garbage output or < 1 t/s speeds, pin explicitly:
+```bash
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=XX
+# XX = 75 (GTX 1660 Ti), 86 (RTX 3060), 89 (RTX 4060), etc.
 ```
 
 ### 2. CPU and CUDA use DIFFERENT rotations — DO NOT MIX
@@ -174,7 +181,7 @@ quantize in SET_ROWS template, Lloyd-Max boundary search (15 comparisons/value).
 
 ```bash
 # Build
-cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j$(nproc)
 
 # Quick sanity (should produce coherent answer, ~34 t/s gen)

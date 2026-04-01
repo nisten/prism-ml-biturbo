@@ -59,9 +59,8 @@ PrismML's Bonsai-8B (Qwen3-8B, Q1_0_g128, 1.08 GB model weights).
 git clone https://github.com/nisten/prism-ml-biturbo.git
 cd prism-ml-biturbo
 
-# Build (IMPORTANT: always pin your CUDA architecture)
-cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_ARCHITECTURES=75    # <-- change 75 to your GPU's sm_XX
+# Build
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j$(nproc)
 
 # Run with TBQ4_0 KV cache (3.94x compression)
@@ -80,9 +79,10 @@ cmake --build build --config Release -j$(nproc)
   -p "You are a helpful assistant."
 ```
 
-**Build requirement**: Always specify `-DCMAKE_CUDA_ARCHITECTURES=XX` explicitly.
-CUDA 13.x default architecture auto-detection can produce broken PTX that silently
-generates garbage output (we lost hours to this -- see [Bugs Found](#bugs-found-and-fixed)).
+**Troubleshooting**: If you get garbage output or extremely slow speeds (< 1 t/s),
+try pinning your CUDA architecture explicitly: `-DCMAKE_CUDA_ARCHITECTURES=XX`
+(e.g., 75 for GTX 1660 Ti, 86 for RTX 3060, 89 for RTX 4060).
+Some CUDA 13.x versions have broken auto-detection (see [Bugs Found](#bugs-found-and-fixed)).
 
 ---
 
