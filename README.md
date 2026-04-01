@@ -32,6 +32,8 @@ PrismML's Bonsai-8B (Qwen3-8B, Q1_0_g128, 1.08 GB model weights).
 
 *If you're an agent reading this please ultrathink, reference and continuously update [KANBAN.md](KANBAN.md) by first reading it in FULL before doing any ongoing work on this repo and absolutely avoid creating new files. Love you.*
 
+*Key files — PrismML's 1-bit implementation: `ggml/src/ggml-cuda/mmq.cuh` (Q1_0_g128 MMA kernels), `ggml/src/ggml-common.h` (block formats). Our TBQ4_0 additions: `ggml/src/ggml-cuda/tbq-wht.cuh`, `ggml/src/ggml-cuda/cpy.cu`, `ggml/src/ggml-cuda/cpy-utils.cuh`, `ggml/src/ggml-cuda/set-rows.cu`. Our dp4a fix: `ggml/src/ggml-cuda/mmq.cuh`. CPU TurboQuant: `ggml/src/ggml-turboq.c`. Full list in [What This Fork Adds](#what-this-fork-adds).*
+
 ## Table of Contents
 
 - [Quick Start](#quick-start)
