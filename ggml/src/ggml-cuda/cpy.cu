@@ -397,8 +397,9 @@ __global__ void cpy_tbq4_0_f32_kernel(
     const int lid = tid & 127;     // lane within 128-element sub-block
     const int sb  = tid >> 7;      // sub-block index: 0 or 1
 
-    const uint8_t * qs  = (const uint8_t *)(src_blocks + blk * 130);
-    const float     norm = __half2float(*(const ggml_half *)(src_blocks + blk * 130 + 128));
+    const int64_t blk_bytes = sizeof(block_tbq4_0);  // 130: qs[128] + d[2]
+    const uint8_t * qs  = (const uint8_t *)(src_blocks + blk * blk_bytes);
+    const float     norm = __half2float(*(const ggml_half *)(src_blocks + blk * blk_bytes + 128));
 
     __shared__ float smem[256];
 

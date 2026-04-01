@@ -9,8 +9,17 @@
 //
 // Both CPY (dequant TBQ4_0→F32) and SET_ROWS (quant F32→TBQ4_0) must use
 // the same transform (inverse/forward respectively) for correctness.
+//
+// WARNING: The CPU path (ggml-turboq.c) uses Householder QR rotation, which is
+// a DIFFERENT orthogonal transform from the FWHT used here. Blocks quantized by
+// one rotation cannot be dequantized by the other — the result is garbage.
+// KV cache is ephemeral and rebuilt each session, so this is safe as long as
+// both quantize and dequantize happen on the same backend (both CUDA or both CPU).
+// Mixing backends (e.g. CPU quantize with CUDA dequantize via -nkvo) WILL produce
+// silently wrong results. TODO: port FWHT to the CPU path for consistency.
 
 #include "ggml-common.h"
+#include <atomic>
 
 // ─── Device constants ────────────────────────────────────────────────────────
 
@@ -27,7 +36,8 @@ __device__ __constant__ float d_tbq4_boundaries[15];
 
 // ─── Host initialization ─────────────────────────────────────────────────────
 
-static bool g_tbq_wht_initialized = false;
+static std::atomic<bool> g_tbq_wht_initialized{false};
+static std::atomic<bool> g_tbq_wht_initializing{false};
 
 static inline uint64_t tbq_splitmix64(uint64_t * state) {
     uint64_t z = (*state += 0x9e3779b97f4a7c15ULL);
@@ -37,7 +47,15 @@ static inline uint64_t tbq_splitmix64(uint64_t * state) {
 }
 
 static void tbq_wht_init(void) {
-    if (g_tbq_wht_initialized) return;
+    if (g_tbq_wht_initialized.load(std::memory_order_acquire)) return;
+
+    // Spin-lock style init: only one thread does the work
+    bool expected = false;
+    if (!g_tbq_wht_initializing.compare_exchange_strong(expected, true)) {
+        // Another thread is initializing — spin until done
+        while (!g_tbq_wht_initialized.load(std::memory_order_acquire)) {}
+        return;
+    }
 
     // Generate sign arrays from fixed seed (must never change — determines rotation)
     float s1[128], s2[128];
@@ -70,7 +88,7 @@ static void tbq_wht_init(void) {
     };
     CUDA_CHECK(cudaMemcpyToSymbol(d_tbq4_boundaries, bnd, sizeof(bnd)));
 
-    g_tbq_wht_initialized = true;
+    g_tbq_wht_initialized.store(true, std::memory_order_release);
 }
 
 // ─── Device quantize helper ───────────────────────────────────────────────────

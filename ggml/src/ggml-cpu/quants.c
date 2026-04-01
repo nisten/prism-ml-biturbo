@@ -1301,6 +1301,7 @@ void ggml_vec_dot_tbq3_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 
     const int nb = n / QK_K;
     float * tmp = (float *)malloc(n * sizeof(float));
+    GGML_ASSERT(tmp && "TBQ3_0 vec_dot: allocation failed");
     dequantize_row_tbq3_0((const block_tbq3_0 *)vx, tmp, n);
 
     const block_q8_K * GGML_RESTRICT y = (const block_q8_K *)vy;
@@ -1323,6 +1324,7 @@ void ggml_vec_dot_tbq4_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 
     const int nb = n / QK_K;
     float * tmp = (float *)malloc(n * sizeof(float));
+    GGML_ASSERT(tmp && "TBQ4_0 vec_dot: allocation failed");
     dequantize_row_tbq4_0((const block_tbq4_0 *)vx, tmp, n);
 
     const block_q8_K * GGML_RESTRICT y = (const block_q8_K *)vy;
