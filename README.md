@@ -8,6 +8,16 @@ Extremely alpha and buggy fork of [PrismML/llama.cpp](https://github.com/PrismML
 1. dp4a integer matmul kernel for Q1_0_g128 on non-RTX Turing GPUs
 2. TBQ4_0 (TurboQuant 4-bit) KV cache quantization with CUDA quantize + dequantize
 3. Fast Walsh-Hadamard Transform (FWHT) for O(n log n) rotation instead of O(n^2) Householder
+4. ggerganov's Hadamard activation rotation ([PR #21038](https://github.com/ggml-org/llama.cpp/pull/21038)) ported to PrismML base
+
+**Note on upstream llama.cpp status (2026-04-01)**: Upstream has merged the Hadamard
+*rotation foundation* (attn_rot, PR #21038) which improves quality for existing quant
+types (q4_0, q8_0, etc.). However, upstream has **NOT** merged TurboQuant itself --
+[elusznik's CPU-only TBQ PR #21089](https://github.com/ggml-org/llama.cpp/pull/21089) is
+still open and awaiting review. Our fork adds the actual TBQ4_0 type with full CUDA
+support (SET_ROWS quantize + CPY dequantize) on top of PrismML's 1-bit base.
+See the [TurboQuant discussion](https://github.com/ggml-org/llama.cpp/discussions/20969)
+for context on the broader community effort.
 
 Tested on GTX 1660 Ti (Turing, sm_75, 6 GB GDDR6, NO tensor cores) running
 PrismML's Bonsai-8B (Qwen3-8B, Q1_0_g128, 1.08 GB model weights).
@@ -503,9 +513,11 @@ for (int i = 0; i < 128; i++)
 
 - [PrismML/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) -- base fork with Q1_0_g128 1-bit kernels
 - [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) -- upstream llama.cpp
-- [spiritbuun/llama-cpp-turboquant-cuda](https://github.com/spiritbuun/llama-cpp-turboquant-cuda) -- FWHT CUDA TurboQuant reference (inspired our FWHT implementation)
-- [TheTom/turboquant_plus](https://github.com/TheTom/turboquant_plus) -- Metal+CUDA+HIP TurboQuant
-- [elusznik's PR #21089](https://github.com/ggml-org/llama.cpp/pull/21089) -- CPU TBQ3_0/TBQ4_0 (our CPU path is based on this)
+- [ggml-org/llama.cpp#21038](https://github.com/ggml-org/llama.cpp/pull/21038) -- ggerganov's Hadamard activation rotation (merged, ported here)
+- [ggml-org/llama.cpp#21089](https://github.com/ggml-org/llama.cpp/pull/21089) -- elusznik's CPU TBQ3_0/TBQ4_0 (open, our CPU path based on this)
+- [ggml-org/llama.cpp#20969](https://github.com/ggml-org/llama.cpp/discussions/20969) -- TurboQuant community discussion
+- [spiritbuun/llama-cpp-turboquant-cuda](https://github.com/spiritbuun/llama-cpp-turboquant-cuda) -- FWHT CUDA TurboQuant (inspired our FWHT implementation)
+- [TheTom/turboquant_plus](https://github.com/TheTom/turboquant_plus) -- Metal+CUDA+HIP TurboQuant (Tom Turney, most active contributor)
 - TurboQuant paper: Walsh-Hadamard rotation + Lloyd-Max scalar quantization for KV cache compression
 
 ---
