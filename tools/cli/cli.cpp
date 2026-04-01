@@ -53,6 +53,7 @@ struct cli_context {
     std::vector<raw_buffer> input_files;
     task_params defaults;
     bool verbose_prompt;
+    int  reasoning_budget = -1;
 
     // thread for showing "loading" animation
     std::atomic<bool> loading_show;
@@ -63,6 +64,7 @@ struct cli_context {
         defaults.n_keep      = params.n_keep;
         defaults.n_predict   = params.n_predict;
         defaults.antiprompt  = params.antiprompt;
+        reasoning_budget     = params.reasoning_budget;
 
         defaults.stream = true; // make sure we always use streaming mode
         defaults.timings_per_token = true; // in order to get timings even when we cancel mid-way
@@ -188,7 +190,7 @@ struct cli_context {
         inputs.use_jinja             = chat_params.use_jinja;
         inputs.parallel_tool_calls   = false;
         inputs.add_generation_prompt = true;
-        inputs.enable_thinking       = chat_params.enable_thinking;
+        inputs.enable_thinking       = (reasoning_budget != 0) && chat_params.enable_thinking;
 
         // Apply chat template to the list of messages
         return common_chat_templates_apply(chat_params.tmpls.get(), inputs);
