@@ -1,3 +1,515 @@
+# prism-ml-biturbo
+
+**TurboQuant 4-bit KV cache with full CUDA support for PrismML's 1-bit llama.cpp fork**
+
+Fork of [PrismML/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) adding:
+1. dp4a integer matmul kernel for Q1_0_g128 on non-RTX Turing GPUs
+2. TBQ4_0 (TurboQuant 4-bit) KV cache quantization with CUDA quantize + dequantize
+3. Fast Walsh-Hadamard Transform (FWHT) for O(n log n) rotation instead of O(n^2) Householder
+
+Tested on GTX 1660 Ti (Turing, sm_75, 6 GB GDDR6, NO tensor cores) running
+PrismML's Bonsai-8B (Qwen3-8B, Q1_0_g128, 1.08 GB model weights).
+
+```
++---------------------------------------------------------------------+
+|                        BENCHMARK RESULTS                            |
+|                   GTX 1660 Ti / Bonsai-8B 1-bit                     |
++---------------------------+------------+---------+------------------+
+| Configuration             | Prompt t/s | Gen t/s | KV Compression   |
++---------------------------+------------+---------+------------------+
+| f16 KV (baseline)         |       86.1 |    53.3 | 1.0x  (512 B)   |
+| TBQ4_0 CPU fallback (bug) |        --- |     0.9 | 3.94x (130 B)   |
+| TBQ4_0 CPU KV  (-nkvo)   |       24.0 |     9.7 | 3.94x (130 B)   |
+| TBQ4_0 full GPU KV        |        --- |    34.4 | 3.94x (130 B)   |
++---------------------------+------------+---------+------------------+
+  "KV Compression" = bytes per 256 elements (one TBQ4_0 block)
+  "full GPU KV"    = FWHT SET_ROWS, no -nkvo flag needed
+```
+
+---
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [What This Fork Adds](#what-this-fork-adds)
+- [The Model: Bonsai-8B / Q1_0_g128](#the-model-bonsai-8b--q1_0_g128)
+- [Phase 1: dp4a Kernel for Non-RTX Turing](#phase-1-dp4a-kernel-for-non-rtx-turing)
+- [Phase 2: TurboQuant TBQ4_0 KV Cache](#phase-2-turboquant-tbq4_0-kv-cache)
+- [Phase 3: FWHT + Full GPU KV Cache](#phase-3-fwht--full-gpu-kv-cache)
+- [Bugs Found and Fixed](#bugs-found-and-fixed)
+- [File Changes Summary](#file-changes-summary)
+- [Known Issues and TODOs](#known-issues-and-todos)
+- [How TBQ4_0 Works](#how-tbq4_0-works)
+- [FWHT Math](#fwht-math)
+- [Credits and References](#credits-and-references)
+- [Original llama.cpp README](#original-llamacpp-readme)
+
+---
+
+## Quick Start
+
+```bash
+# Clone
+git clone https://github.com/nisten/prism-ml-biturbo.git
+cd prism-ml-biturbo
+
+# Build (IMPORTANT: always pin your CUDA architecture)
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=75    # <-- change 75 to your GPU's sm_XX
+cmake --build build --config Release -j$(nproc)
+
+# Run with TBQ4_0 KV cache (3.94x compression)
+./build/bin/llama-cli \
+  -m /path/to/Bonsai-8B.gguf \
+  -c 12000 -ngl 99 -fa on -t 4 --mlock \
+  --chat-template chatml -cnv \
+  -p "You are a helpful assistant." --temp 0.5 \
+  -ctk tbq4_0 -ctv tbq4_0
+
+# Run with default f16 KV cache (no compression, faster)
+./build/bin/llama-cli \
+  -m /path/to/Bonsai-8B.gguf \
+  -c 12000 -ngl 99 -fa on -t 4 --mlock \
+  --chat-template chatml -cnv \
+  -p "You are a helpful assistant."
+```
+
+**Build requirement**: Always specify `-DCMAKE_CUDA_ARCHITECTURES=XX` explicitly.
+CUDA 13.x default architecture auto-detection can produce broken PTX that silently
+generates garbage output (we lost hours to this -- see [Bugs Found](#bugs-found-and-fixed)).
+
+---
+
+## What This Fork Adds
+
+24 files changed, +1235 lines, -26 lines over PrismML base.
+
+```
+CHANGES vs PrismML upstream (prism branch)
+==========================================
+
+New files:
+  ggml/src/ggml-cuda/tbq-wht.cuh      FWHT infrastructure (sign arrays, codebook, init)
+  ggml/src/ggml-turboq-tables.h        Lloyd-Max codebooks for 2/3/4-bit quantization
+  ggml/src/ggml-turboq.h               TurboQuant rotation API header
+  ggml/src/ggml-turboq.c               Full rotation + quantize/dequantize (688 lines)
+
+Modified CUDA files:
+  ggml/src/ggml-cuda/cpy.cu            TBQ4_0->F32 CUDA dequant kernel (FWHT inverse)
+  ggml/src/ggml-cuda/cpy-utils.cuh     F32->TBQ4_0 CUDA quant function (FWHT forward)
+  ggml/src/ggml-cuda/set-rows.cu       TBQ4_0 dispatch in SET_ROWS operation
+  ggml/src/ggml-cuda/ggml-cuda.cu      TBQ4_0 registered in CPY + SET_ROWS supports_op
+  ggml/src/ggml-cuda/mmq.cuh           dp4a kernel for Q1_0_g128 (non-RTX Turing)
+
+Modified core files:
+  ggml/include/ggml.h                  GGML_TYPE_TBQ3_0 (42), TBQ4_0 (43), COUNT=44
+  ggml/src/ggml-common.h               block_tbq3_0 (98B), block_tbq4_0 (130B) structs
+  ggml/src/ggml.c                      type_traits, ftype mapping, quantize dispatch
+  ggml/src/ggml-quants.h               quantize/dequantize declarations
+  ggml/src/CMakeLists.txt              turboq source files added to build
+
+Modified CPU files:
+  ggml/src/ggml-cpu/ggml-cpu.c         CPU type_traits for TBQ (vec_dot + from_float)
+  ggml/src/ggml-cpu/ops.cpp            TBQ CPU operations support
+  ggml/src/ggml-cpu/quants.c           vec_dot_tbq3_0_q8_K, vec_dot_tbq4_0_q8_K
+  ggml/src/ggml-cpu/quants.h           vec_dot declarations
+
+Modified llama files:
+  include/llama.h                      LLAMA_FTYPE_MOSTLY_TBQ3_0 / TBQ4_0
+  src/llama-model-loader.cpp           ftype string + type mapping
+  src/llama-kv-cache.cpp               3D view for TBQ K/V (block_size > head_dim)
+  src/llama-graph.cpp                  TBQ cast+reshape before attention permute
+  src/llama-context.cpp                TBQ KV cache initialization
+  common/arg.cpp                       TBQ3_0/TBQ4_0 in kv_cache_types
+```
+
+---
+
+## The Model: Bonsai-8B / Q1_0_g128
+
+PrismML's Bonsai-8B is Qwen3-8B quantized to 1-bit (Q1_0_g128):
+- 8.19 billion parameters compressed to 1.08 GB (1.126 bits per weight)
+- Architecture: 36 layers, GQA (32 query heads / 8 KV heads), SwiGLU FFN
+- Each weight is a single bit (sign only), groups of 128 share one FP16 scale
+- Block format: 2 bytes (FP16 scale) + 16 bytes (128 sign bits) = 18 bytes per 128 weights
+- bit=1 means +scale, bit=0 means -scale
+
+```
+Q1_0_g128 block layout (18 bytes per 128 weights):
++-------+---------------------------------------------------+
+| scale |                  128 sign bits                     |
+| FP16  |              (16 bytes = 128 bits)                 |
+| 2B    |  bit[i]=1 -> +scale,  bit[i]=0 -> -scale          |
++-------+---------------------------------------------------+
+```
+
+Standard llama.cpp does not support Q1_0_g128. This format requires PrismML's fork
+which adds dedicated CUDA and CPU kernels for 1-bit inference.
+
+---
+
+## Phase 1: dp4a Kernel for Non-RTX Turing
+
+**Problem**: PrismML's Q1_0_g128 CUDA kernels only support the MMA (tensor core) path.
+The GTX 1660 Ti is Turing (sm_75) but has NO tensor cores -- MMA instructions are
+emulated in software, producing a "suboptimal performance" warning and leaving
+performance on the table.
+
+**Root cause**: `TURING_MMA_AVAILABLE` is defined for all `__CUDA_ARCH__ >= 750`,
+which incorrectly includes GTX 1660 Ti. Q1_0_g128 has dp4a intentionally disabled
+in `mmq.cuh` line 513 (`NO_DEVICE_CODE` for the dp4a path).
+
+**Key insight**: After bit-unpacking, Q1_0_g128 data is identical to Q8_0 format
+(signed int8 values). We can replicate the scale 4x during tile load and reuse
+`vec_dot_q8_0_q8_1_dp4a` unchanged.
+
+**Changes** (`ggml/src/ggml-cuda/mmq.cuh`):
+1. Added `GGML_TYPE_Q1_0_g128` to `mmq_get_dp4a_tile_x_sizes()` returning `MMQ_DP4A_TXS_Q8_0`
+2. Rewrote `load_tiles_q1_0_g128` with dual MMA/dp4a branches
+3. Updated `mmq_type_traits<Q1_0_g128>::vec_dot_dp4a` from `disabled` to `vec_dot_q8_0_q8_1_dp4a`
+
+```
+Results (GTX 1660 Ti, sm_75):
++------------+-------------+--------------+---------+
+| Metric     | MMA (stock) | dp4a (ours)  | Change  |
++------------+-------------+--------------+---------+
+| Generation |  49.2 t/s   |  54.1 t/s    | +10%    |
+| Prompt     |  85.5 t/s   |  85.0 t/s    | ~same   |
++------------+-------------+--------------+---------+
+  Prompt is memory-bandwidth bound, generation is compute bound.
+  dp4a removes the tensor core emulation overhead.
+```
+
+---
+
+## Phase 2: TurboQuant TBQ4_0 KV Cache
+
+**Goal**: Compress the KV cache using TurboQuant 4-bit quantization (TBQ4_0) to fit
+longer contexts in limited VRAM. The 1-bit model weights are only 1.08 GB, but at
+16K context the f16 KV cache alone consumes ~575 MB. With 3.94x compression, TBQ4_0
+reduces this to ~146 MB.
+
+**What is TBQ4_0?** Walsh-Hadamard Transform rotation + Lloyd-Max scalar 4-bit
+quantization, achieving near-zero quality loss at 3.94x compression. Each 256-element
+block is stored as 130 bytes (128 nibble-packed quantized values + 2 bytes FP16 norm).
+
+**Implementation** (ported from elusznik's PR #21089 CPU implementation):
+- Registered `GGML_TYPE_TBQ4_0` (type ID 43) in ggml.h
+- Added `block_tbq4_0` struct (130 bytes: 128 qs + 2 d) in ggml-common.h
+- Ported full rotation + quantize/dequantize (688 lines) in ggml-turboq.c
+- Added Lloyd-Max codebooks in ggml-turboq-tables.h
+- Wired into KV cache system (llama-kv-cache, llama-graph, llama-context)
+- Added `-ctk tbq4_0 -ctv tbq4_0` CLI support via common/arg.cpp
+- Added CPU vec_dot for flash attention fallback
+
+**Initial results**: TBQ4_0 produced coherent output with the CPU quantize/dequantize
+path, but was bottlenecked by the GGML scheduler silently falling back to CPU for the
+dequantize operation (see [Bugs Found](#bugs-found-and-fixed) for the full story).
+
+---
+
+## Phase 3: FWHT + Full GPU KV Cache
+
+**Motivation**: spiritbuun's llama-cpp-turboquant-cuda demonstrated that using
+Fast Walsh-Hadamard Transform (FWHT) instead of Householder QR rotation achieves
+99.6% prefill / 97.5% decode speed vs f16 baseline on RTX 3090. FWHT is O(n log n)
+vs Householder O(n^2), uses 256 bytes of sign arrays instead of a 64 KB rotation matrix,
+and has a butterfly structure that maps naturally to GPU parallelism.
+
+**The two CUDA operations needed**:
+
+```
+                    +-----------+
+   F32 values --->  | SET_ROWS  | ---> TBQ4_0 blocks in GPU KV cache
+   (new tokens)     | (quant)   |      (FWHT forward rotation + Lloyd-Max 4-bit)
+                    +-----------+
+
+                    +-----------+
+   TBQ4_0 blocks -> |    CPY    | ---> F32 values for attention computation
+   (from KV cache)  | (dequant) |      (FWHT inverse rotation + codebook lookup)
+                    +-----------+
+```
+
+**New file: `ggml/src/ggml-cuda/tbq-wht.cuh`**
+
+Shared FWHT infrastructure used by both operations:
+- Device constant sign arrays: `d_tbq_wht_s1[128]`, `d_tbq_wht_s2[128]` (each +/-1.0f)
+- Device constant scaled codebook: `d_tbq4_codebook_scaled[16]` (codebook / sqrt(256))
+- Device constant boundaries: `d_tbq4_boundaries[15]` (Lloyd-Max decision boundaries)
+- `tbq_wht_init()`: lazy host init, generates sign arrays from splitmix64 PRNG with
+  fixed seed `0x517cc1b727220a95ULL`, uploads via `cudaMemcpyToSymbol`
+- `tbq_quantize_4bit()`: device function mapping float to 4-bit index via boundary search
+
+**CPY kernel (dequantize TBQ4_0 -> F32)** in `ggml/src/ggml-cuda/cpy.cu`:
+- 256 threads per block (one block per TBQ4_0 block)
+- Threads 0-127 handle sub-block 0, threads 128-255 handle sub-block 1
+- Step 1: Each thread unpacks its nibble from qs[], looks up scaled codebook value
+- Step 2: FWHT inverse via shared memory (7 butterfly passes with __syncthreads)
+- Step 3: Multiply by FP16 norm, write to F32 output
+
+**SET_ROWS quantize function** in `ggml/src/ggml-cuda/cpy-utils.cuh`:
+- `quantize_f32_tbq4_0_block()`: single-threaded F32[256] -> block_tbq4_0
+- Called from the existing `k_set_rows_quant` template (one CUDA thread per output block)
+- Computes L2 norm, normalizes to unit vector
+- Applies FWHT forward rotation (s1 multiply, 7 butterfly passes, normalize, s2 multiply)
+- Quantizes rotated values via boundary comparison, nibble-packs into qs[]
+- Stores FP16 norm in the block's d field
+
+---
+
+## Bugs Found and Fixed
+
+### Bug 1: CUDA 13.x Default Architecture Produces Garbage
+
+**Symptom**: ALL inference produced garbage output at 0.1-0.3 t/s, regardless of model,
+quantization type, or branch. Even the unmodified PrismML base branch was affected.
+
+**Root cause**: CUDA 13.1 default architecture auto-detection compiles PTX for all
+supported architectures. The JIT compiler then selects PTX for the GTX 1660 Ti but
+picks a suboptimal or incorrect target. This affects the entire computation, not just
+specific quantization types.
+
+**Resolution**: ALWAYS specify `-DCMAKE_CUDA_ARCHITECTURES=75` (or your GPU's sm_XX)
+when building. This was discovered through a Kepner-Tregoe IS/IS-NOT analysis:
+
+```
+ IS                       IS NOT                 DISTINCTION
+ -----------------------  ---------------------- -------------------------
+ ALL inference garbage    Code bug               Even pristine PrismML base
+ (0.1 t/s, broken)                              broken with default cmake
+
+ Default cmake flags      cmake with             -DCMAKE_CUDA_ARCH=75
+ (-DGGML_CUDA=ON only)    -DCMAKE_CUDA_ARCH=75   works (53.3 t/s, coherent)
+
+ After rm -rf build +     Earlier builds         Earlier build had sm_75
+ rebuild without flag      that worked fine        pinned from prior cmake
+```
+
+### Bug 2: Silent CPU Fallback for TBQ4_0 Dequantize
+
+**Symptom**: TBQ4_0 KV cache produced 0.9 t/s generation (60x slower than expected).
+No error messages, no crashes. The model appeared to work but was unusably slow.
+
+**Root cause**: The GGML scheduler's Pass 3 checks `ggml_backend_cuda_device_supports_op()`
+for each operation. `GGML_OP_CPY` with `TBQ4_0->F32` was NOT listed in the CUDA backend's
+supported operations. The scheduler silently assigned dequantization to CPU.
+
+Every decode token: CPU dequantized KV data -> transferred F32 over PCIe -> GPU ran attention.
+The PCIe round-trip dominated latency.
+
+**Fix**: Registered `TBQ4_0->F32` in `ggml_backend_cuda_device_supports_op()` for
+`GGML_OP_CPY` and implemented `cpy_tbq4_0_f32_kernel` on CUDA.
+
+**Result**: 0.9 t/s -> 9.7 t/s (10.8x speedup). Still limited by -nkvo (KV on CPU).
+
+### Bug 3: SIGABRT Without -nkvo (SET_ROWS Not Implemented)
+
+**Symptom**: Without `-nkvo` flag, llama-cli crashes with:
+`cache_k_l0 (view) in a buffer (CUDA0) that cannot run the operation (SET_ROWS)`
+
+**Root cause**: When KV cache is on GPU (no -nkvo), new token K/V values must be
+quantized on the GPU via `GGML_OP_SET_ROWS`. TBQ4_0 was not in the SET_ROWS
+dispatch table or the supports_op check.
+
+**Fix**: Implemented `quantize_f32_tbq4_0_block()` using FWHT forward rotation,
+added dispatch in `set-rows.cu`, registered in `ggml-cuda.cu` supports_op.
+
+**Result**: 9.7 t/s -> 34.4 t/s (3.5x speedup). Full GPU KV cache, no -nkvo needed.
+
+### Bug 4: smem Round-Trip in Dequant Kernel (Security Review)
+
+**Symptom**: No runtime symptoms observed, but a security review flagged that
+the final step in `cpy_tbq4_0_f32_kernel` wrote to shared memory and then read
+it back without a `__syncthreads()` between them.
+
+**Analysis**: Each thread only reads from its own shared memory index, so there
+is no actual cross-thread dependency. The CUDA memory model guarantees intra-thread
+ordering. However, computing the final multiply in a register and writing directly
+to global memory is cleaner and avoids any theoretical concern.
+
+**Fix**: Changed from `sub[lid] *= s1[lid]; dst = sub[lid] * norm;` to
+`float out = sub[lid] * s1[lid]; dst = out * norm;` (register-only, no smem write-back).
+
+---
+
+## File Changes Summary
+
+```
+ggml/src/ggml-cuda/tbq-wht.cuh         86 lines  NEW   FWHT constants + init + quantize helper
+ggml/src/ggml-turboq.c                 688 lines  NEW   CPU rotation + quantize/dequantize
+ggml/src/ggml-turboq.h                  25 lines  NEW   Rotation API header
+ggml/src/ggml-turboq-tables.h           35 lines  NEW   Lloyd-Max codebooks
+ggml/src/ggml-cuda/cpy.cu              +93 lines  MOD   FWHT inverse dequant kernel
+ggml/src/ggml-cuda/cpy-utils.cuh       +59 lines  MOD   FWHT forward quant function
+ggml/src/ggml-cuda/set-rows.cu         +11 lines  MOD   TBQ4_0 dispatch
+ggml/src/ggml-cuda/ggml-cuda.cu         +6 lines  MOD   TBQ4_0 in supports_op (CPY + SET_ROWS)
+ggml/src/ggml-cuda/mmq.cuh             +39 lines  MOD   dp4a for Q1_0_g128
+ggml/src/ggml-common.h                 +17 lines  MOD   block_tbq3_0, block_tbq4_0 structs
+ggml/include/ggml.h                     +6 lines  MOD   Type enums TBQ3_0=42, TBQ4_0=43
+ggml/src/ggml.c                        +20 lines  MOD   type_traits + ftype mapping
+ggml/src/ggml-quants.h                  +6 lines  MOD   Quantize/dequantize declarations
+ggml/src/ggml-cpu/quants.c             +46 lines  MOD   CPU vec_dot for TBQ
+ggml/src/ggml-cpu/ggml-cpu.c           +13 lines  MOD   CPU type_traits for TBQ
+ggml/src/ggml-cpu/ops.cpp              +14 lines  MOD   CPU TBQ operations
+ggml/src/CMakeLists.txt                 +3 lines  MOD   Build system
+include/llama.h                         +2 lines  MOD   LLAMA_FTYPE entries
+src/llama-model-loader.cpp              +4 lines  MOD   ftype string mapping
+src/llama-kv-cache.cpp                 +18 lines  MOD   3D view for TBQ K/V
+src/llama-graph.cpp                    +36 lines  MOD   TBQ cast+reshape
+src/llama-context.cpp                  +30 lines  MOD   TBQ KV init
+common/arg.cpp                          +2 lines  MOD   CLI --cache-type support
+```
+
+---
+
+## Known Issues and TODOs
+
+**Known issues**:
+- CPU-only inference with TBQ4_0 produces garbage (0.3 t/s). The CPU flash attention
+  path has issues with TBQ4_0 vec_dot. GPU inference works correctly.
+- The runtime warning "suboptimal performance due to a lack of tensor cores" still
+  appears on GTX 1660 Ti. This is a cosmetic check in ggml_cuda_init that tests for
+  tensor cores at runtime, not affected by our dp4a kernel being active. Harmless.
+- TBQ3_0 (3-bit TurboQuant) type is registered but NOT implemented in CUDA.
+  Only TBQ4_0 has complete CUDA support.
+- The FWHT rotation is different from the Householder QR rotation used in the CPU
+  reference implementation (ggml-turboq.c). Both are valid random orthogonal rotations
+  but they are NOT interchangeable. The GPU path (FWHT) and CPU path (Householder)
+  produce different quantized blocks for the same input. Since KV cache is ephemeral
+  (rebuilt each session), this is not a correctness issue -- but mixing GPU quantize
+  with CPU dequantize (or vice versa) would produce garbage.
+
+**TODOs**:
+- [ ] Benchmark 16K context with full GPU KV (measure VRAM usage)
+- [ ] Test maximum context length that fits in 6 GB VRAM
+- [ ] Benchmark on other GPUs (RTX 3060, 4060, A100)
+- [ ] Upstream the dp4a Q1_0_g128 fix to PrismML
+- [ ] Consider multi-threaded CUDA quantize kernel for SET_ROWS (currently single-threaded
+      per block via k_set_rows_quant template -- fine for decode but slow for large batch prefill)
+- [ ] Port FWHT to the CPU path (replace Householder) for consistency
+- [ ] TBQ3_0 CUDA implementation (2.5x compression, higher quality)
+- [ ] Profile the FWHT butterfly passes -- the 7 __syncthreads calls per dequant block
+      may be optimizable with warp-level primitives for the first 5 passes (h <= 32)
+
+---
+
+## How TBQ4_0 Works
+
+TBQ4_0 quantizes 256-element vectors (one per KV cache block) to 130 bytes:
+
+```
+Quantize (F32 -> TBQ4_0):
+  1. Compute L2 norm:  norm = ||x||
+  2. Normalize:        u = x / norm
+  3. Split into two 128-element sub-blocks
+  4. For each sub-block:
+     a. Forward FWHT rotation:  y = D_s2 * H_norm * D_s1 * u
+     b. Scale up:               z = y * sqrt(256)
+     c. Lloyd-Max 4-bit quantize: idx[i] = argmin_k |z[i] - codebook[k]|
+     d. Nibble pack:            qs[j/2] = idx[j] | (idx[j+1] << 4)
+  5. Store FP16 norm
+
+Dequantize (TBQ4_0 -> F32):
+  1. Unpack nibbles:   idx[i] = qs[i/2] & 0x0F or qs[i/2] >> 4
+  2. Codebook lookup:  y[i] = codebook[idx[i]] / sqrt(256)
+  3. For each sub-block:
+     a. Inverse FWHT:  u = D_s1 * H_norm * D_s2 * y
+  4. Scale by norm:    x[i] = u[i] * norm
+
+Block layout (130 bytes):
++----------------------------------------------------------+------+
+|                  qs[128] (nibble-packed)                   |  d   |
+|  256 values packed as 128 bytes (low nibble + high nibble) | FP16 |
++----------------------------------------------------------+------+
+  offset 0                                                    128
+```
+
+The Lloyd-Max codebook for 4-bit (16 levels) optimized for standard normal distribution:
+
+```
+Index:  0       1       2       3       4       5       6       7
+Value: -2.7326 -2.0690 -1.6180 -1.2562 -0.9424 -0.6568 -0.3881 -0.1284
+
+Index:  8       9      10      11      12      13      14      15
+Value:  0.1284  0.3881  0.6568  0.9424  1.2562  1.6180  2.0690  2.7326
+```
+
+---
+
+## FWHT Math
+
+The Fast Walsh-Hadamard Transform provides O(n log n) random orthogonal rotation
+using only element-wise sign flips and butterfly additions. No matrix storage needed.
+
+```
+Forward transform:   y = D_s2 * H_norm * D_s1 * x
+Inverse transform:   x = D_s1 * H_norm * D_s2 * y
+
+Where:
+  D_s1, D_s2 = diagonal matrices of +/-1 (random signs from splitmix64 PRNG)
+  H_norm     = H / sqrt(n)  (normalized Hadamard matrix, n=128)
+  H          = 128x128 Walsh-Hadamard matrix (defined recursively)
+
+Properties:
+  - H * H = n * I       (Hadamard is self-inverse up to scale)
+  - D_si * D_si = I     (sign matrices are self-inverse)
+  - Forward(Inverse(x)) = x  (exact round-trip, proof below)
+
+Proof of inverse:
+  D_s1 * H_norm * D_s2 * (D_s2 * H_norm * D_s1 * x)
+  = D_s1 * H_norm * (D_s2 * D_s2) * H_norm * D_s1 * x
+  = D_s1 * H_norm * I * H_norm * D_s1 * x
+  = D_s1 * (H_norm * H_norm) * D_s1 * x
+  = D_s1 * (H*H / n) * D_s1 * x
+  = D_s1 * (n*I / n) * D_s1 * x
+  = D_s1 * D_s1 * x
+  = x
+
+The butterfly structure of WHT for n=128:
+  7 passes (log2(128) = 7), each pass with stride h = 1, 2, 4, 8, 16, 32, 64
+  Each butterfly:  a' = a + b,  b' = a - b
+
+  for h in {1, 2, 4, 8, 16, 32, 64}:
+    for j in {0, 1, ..., 127}:
+      if (j & h) == 0:
+        a = buf[j],  b = buf[j | h]
+        buf[j] = a + b,  buf[j | h] = a - b
+
+Operation count: 128 * 7 = 896 additions/subtractions
+vs. Householder matvec: 128 * 128 = 16384 multiply-adds (18x more)
+```
+
+The sign arrays are generated deterministically from a fixed seed so that every
+process produces the same rotation. This is critical -- if the quantize and dequantize
+paths use different sign arrays, the inverse rotation is wrong and output is garbage.
+
+```c
+uint64_t state = 0x517cc1b727220a95ULL;  // fixed seed, must never change
+for (int i = 0; i < 128; i++)
+    s1[i] = (splitmix64_next(&state) & 1) ? +1.0f : -1.0f;
+for (int i = 0; i < 128; i++)
+    s2[i] = (splitmix64_next(&state) & 1) ? +1.0f : -1.0f;
+```
+
+---
+
+## Credits and References
+
+- [PrismML/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) -- base fork with Q1_0_g128 1-bit kernels
+- [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) -- upstream llama.cpp
+- [spiritbuun/llama-cpp-turboquant-cuda](https://github.com/spiritbuun/llama-cpp-turboquant-cuda) -- FWHT CUDA TurboQuant reference (inspired our FWHT implementation)
+- [TheTom/turboquant_plus](https://github.com/TheTom/turboquant_plus) -- Metal+CUDA+HIP TurboQuant
+- [elusznik's PR #21089](https://github.com/ggml-org/llama.cpp/pull/21089) -- CPU TBQ3_0/TBQ4_0 (our CPU path is based on this)
+- TurboQuant paper: Walsh-Hadamard rotation + Lloyd-Max scalar quantization for KV cache compression
+
+---
+
+## Original llama.cpp README
+
+*The original llama.cpp README follows below.*
+
+---
+
 # llama.cpp
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
