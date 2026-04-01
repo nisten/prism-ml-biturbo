@@ -211,6 +211,65 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
 }
 
+// TBQ4_0 quantize: F32[256] → block_tbq4_0 (130 bytes: 128 nibble-packed qs + FP16 norm)
+// Uses FWHT forward rotation — must match cpy_tbq4_0_f32_kernel inverse (tbq-wht.cuh).
+// Single-threaded: called from k_set_rows_quant template, no __syncthreads allowed.
+#include "tbq-wht.cuh"
+static __device__ void quantize_f32_tbq4_0_block(
+    const float * __restrict__ x, block_tbq4_0 * __restrict__ y)
+{
+    // Compute L2 norm over all 256 elements
+    float norm2 = 0.0f;
+    #pragma unroll 8
+    for (int j = 0; j < 256; j++) norm2 += x[j] * x[j];
+    const float norm = sqrtf(norm2);
+    const float inv_norm = (norm > 1e-12f) ? (1.0f / norm) : 0.0f;
+
+    // scale_up = sqrt(256) = 16 (codebook was generated at unit norm × scale_down)
+    const float scale_up = 16.0f;
+
+    // Process two 128-element sub-blocks
+    for (int sb = 0; sb < 2; sb++) {
+        float buf[128];
+        const float * src_sub = x + sb * 128;
+
+        // Normalize
+        #pragma unroll 8
+        for (int j = 0; j < 128; j++) buf[j] = src_sub[j] * inv_norm;
+
+        // FWHT forward: apply s1, butterfly, normalize, apply s2
+        #pragma unroll 8
+        for (int j = 0; j < 128; j++) buf[j] *= d_tbq_wht_s1[j];
+
+        #pragma unroll
+        for (int h = 1; h < 128; h <<= 1) {
+            for (int j = 0; j < 128; j++) {
+                if ((j & h) == 0) {
+                    float a = buf[j], b = buf[j | h];
+                    buf[j] = a + b; buf[j | h] = a - b;
+                }
+            }
+        }
+
+        const float inv_sqrt128 = 1.0f / 11.3137085f;  // 1/sqrt(128)
+        #pragma unroll 8
+        for (int j = 0; j < 128; j++) buf[j] *= inv_sqrt128;
+
+        #pragma unroll 8
+        for (int j = 0; j < 128; j++) buf[j] *= d_tbq_wht_s2[j];
+
+        // Quantize + nibble pack
+        const int base_byte = sb * 64;  // 128 elements / 2 per byte
+        for (int j = 0; j < 128; j += 2) {
+            const uint8_t i0 = tbq_quantize_4bit(buf[j]     * scale_up);
+            const uint8_t i1 = tbq_quantize_4bit(buf[j + 1] * scale_up);
+            y->qs[base_byte + j / 2] = i0 | (i1 << 4);
+        }
+    }
+
+    y->d = __float2half(norm);
+}
+
 template<typename src_t, typename dst_t>
 static __device__ void cpy_1_scalar(const char * cxi, char * cdsti) {
     *(dst_t *) cdsti = ggml_cuda_cast<dst_t>(*(const src_t *) cxi);

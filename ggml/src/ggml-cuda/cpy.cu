@@ -2,7 +2,6 @@
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
 #include "../ggml-common.h"
-#include "../ggml-turboq.h"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
@@ -372,114 +371,69 @@ static void ggml_cpy_f32_iq4_nl_cuda(
 }
 
 // ---------------------------------------------------------------------------
-// TBQ4_0 → F32 dequantize on CUDA
+// TBQ4_0 → F32 dequantize on CUDA using Fast Walsh-Hadamard Transform (FWHT)
 //
 // block_tbq4_0: uint8_t qs[128] (nibble-packed, 256 values), ggml_half d
-// Dequant: nibble → codebook*scale_down → Q^T matvec (inverse rotation) → * norm
-// The 256-element block uses two independent 128-element sub-blocks with the same Q.
+// Dequant: nibble → codebook*scale_down → FWHT inverse rotation → * norm
+// Two independent 128-element sub-blocks per block.
+// FWHT inverse: x = D_s1 · H_norm · D_s2 · y  (apply s2, butterfly, scale, apply s1)
 // ---------------------------------------------------------------------------
 
-#define TBQ4_DIM 128
+#include "tbq-wht.cuh"
+
 #define TBQ4_QK  256
 
-// Codebook × scale_down precomputed (scale_down = 1/sqrt(256) = 1/16)
-__device__ __constant__ float d_tbq4_codebook_scaled[16];
-
-// Q^T stored row-major on device: d_tbq4_QT[j*128 + i] = Q^T_{ji} = Q_{ij}
-// Allows thread j to read its row contiguously for the dot product.
-static float * g_d_tbq4_QT = nullptr;
-static bool    g_tbq4_initialized = false;
-
-static void tbq4_cuda_init(void) {
-    if (g_tbq4_initialized) return;
-
-    const int64_t d = TBQ4_DIM;
-    const uint64_t seed = turboq_seed_from_row(0);
-    const float scale_down = 1.0f / sqrtf((float)TBQ4_QK);
-
-    // Get Q column-major from CPU turboq
-    float * Q_cm = (float *)malloc((size_t)(d * d) * sizeof(float));
-    turboq_get_rotation_matrix(d, seed, Q_cm);
-
-    // Build Q^T row-major: QT_rm[j*d + i] = Q_cm[i + j*d]
-    float * QT_rm = (float *)malloc((size_t)(d * d) * sizeof(float));
-    for (int64_t j = 0; j < d; j++) {
-        for (int64_t i = 0; i < d; i++) {
-            QT_rm[j * d + i] = Q_cm[i + j * d];
-        }
-    }
-    free(Q_cm);
-
-    CUDA_CHECK(cudaMalloc(&g_d_tbq4_QT, (size_t)(d * d) * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(g_d_tbq4_QT, QT_rm, (size_t)(d * d) * sizeof(float), cudaMemcpyHostToDevice));
-    free(QT_rm);
-
-    // Upload scaled codebook to constant memory
-    float cb_scaled[16];
-    // turboq_codebook_4bit values (not accessible here directly, hardcode same values)
-    static const float cb[16] = {
-        -2.7326f, -2.0690f, -1.6180f, -1.2562f,
-        -0.9424f, -0.6568f, -0.3881f, -0.1284f,
-         0.1284f,  0.3881f,  0.6568f,  0.9424f,
-         1.2562f,  1.6180f,  2.0690f,  2.7326f
-    };
-    for (int i = 0; i < 16; i++) {
-        cb_scaled[i] = cb[i] * scale_down;
-    }
-    CUDA_CHECK(cudaMemcpyToSymbol(d_tbq4_codebook_scaled, cb_scaled, sizeof(cb_scaled)));
-
-    g_tbq4_initialized = true;
-}
-
 // Each CUDA block handles one TBQ4_0 block (256 output elements).
-// 256 threads: thread t computes output[t].
+// 256 threads: lower 128 handle sub-block 0, upper 128 handle sub-block 1.
 __global__ void cpy_tbq4_0_f32_kernel(
     const char * __restrict__ src_blocks,
     float * __restrict__ dst,
-    int64_t nb,
-    const float * __restrict__ d_QT  // Q^T row-major [128×128] on device
+    int64_t nb
 ) {
-    const int64_t blk_idx = (int64_t)blockIdx.x;
-    if (blk_idx >= nb) return;
+    const int64_t blk = (int64_t)blockIdx.x;
+    if (blk >= nb) return;
 
-    const int tid = threadIdx.x;  // 0..255
+    const int tid = threadIdx.x;   // 0..255
+    const int lid = tid & 127;     // lane within 128-element sub-block
+    const int sb  = tid >> 7;      // sub-block index: 0 or 1
 
-    // block_tbq4_0 layout: qs[128], d[2]
-    const int64_t block_bytes = 128 + 2;
-    const uint8_t * qs = (const uint8_t *)(src_blocks + blk_idx * block_bytes);
-    // d is at offset 128
-    const ggml_half d_fp16 = *reinterpret_cast<const ggml_half *>(src_blocks + blk_idx * block_bytes + 128);
-    const float norm = __half2float(d_fp16);
+    const uint8_t * qs  = (const uint8_t *)(src_blocks + blk * 130);
+    const float     norm = __half2float(*(const ggml_half *)(src_blocks + blk * 130 + 128));
 
-    // Shared: rotated vector (codebook*scale_down, before inverse rotation)
-    __shared__ float rotated[TBQ4_QK];
+    __shared__ float smem[256];
 
-    // Step 1: unpack nibble → codebook value × scale_down
+    // Step 1: unpack nibble → scaled codebook value
     {
-        const uint8_t byte = qs[tid / 2];
-        const uint8_t idx  = (tid % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
-        rotated[tid] = d_tbq4_codebook_scaled[idx];
+        const uint8_t byte = qs[tid >> 1];
+        const uint8_t idx  = (tid & 1) ? (byte >> 4) : (byte & 0x0F);
+        smem[tid] = d_tbq4_codebook_scaled[idx];
     }
     __syncthreads();
 
-    // Step 2: inverse rotation for each 128-element sub-block.
-    // output[tid] = (Q^T * rotated_sub)[tid % 128] * norm
-    // where rotated_sub = rotated[sub_block * 128 : sub_block * 128 + 128]
-    //
-    // Q^T row-major: row local_tid is contiguous at g_d_tbq4_QT + local_tid*128
-    const int local_tid = tid % TBQ4_DIM;    // 0..127
-    const int sub_block = tid / TBQ4_DIM;    // 0 or 1
-    const float * rot_sub  = rotated + sub_block * TBQ4_DIM;
-    const float * qt_row   = d_QT + local_tid * TBQ4_DIM;
+    // Step 2: FWHT inverse on each sub-block simultaneously
+    // Inverse: apply s2, butterfly passes, normalize, apply s1
+    float * sub = smem + sb * 128;
 
-    float sum = 0.0f;
-    // Unroll hint: 128 iterations
-    #pragma unroll 8
-    for (int i = 0; i < TBQ4_DIM; i++) {
-        sum += qt_row[i] * rot_sub[i];
+    sub[lid] *= d_tbq_wht_s2[lid];
+    __syncthreads();
+
+    #pragma unroll
+    for (int h = 1; h < 128; h <<= 1) {
+        if ((lid & h) == 0) {
+            float a = sub[lid], b = sub[lid | h];
+            sub[lid]     = a + b;
+            sub[lid | h] = a - b;
+        }
+        __syncthreads();
     }
 
-    dst[blk_idx * TBQ4_QK + tid] = sum * norm;
+    sub[lid] *= (1.0f / 11.3137085f);  // 1/sqrt(128)
+    __syncthreads();
+
+    sub[lid] *= d_tbq_wht_s1[lid];
+
+    // Step 3: write output
+    dst[blk * 256 + tid] = sub[lid] * norm;
 }
 
 static void ggml_cpy_tbq4_0_f32_cuda(
@@ -493,12 +447,12 @@ static void ggml_cpy_tbq4_0_f32_cuda(
 ) {
     GGML_ASSERT(ne % TBQ4_QK == 0);
 
-    tbq4_cuda_init();
+    tbq_wht_init();
 
     const int64_t nb = ne / TBQ4_QK;
     GGML_ASSERT(nb < (int64_t)INT_MAX);
 
-    cpy_tbq4_0_f32_kernel<<<(unsigned int)nb, TBQ4_QK, 0, stream>>>(cx, (float *)cdst, nb, g_d_tbq4_QT);
+    cpy_tbq4_0_f32_kernel<<<(unsigned int)nb, TBQ4_QK, 0, stream>>>(cx, (float *)cdst, nb);
 
     (void)ne00; (void)ne01; (void)ne02; (void)nb00; (void)nb01; (void)nb02; (void)nb03;
     (void)ne10; (void)ne11; (void)ne12; (void)nb10; (void)nb11; (void)nb12; (void)nb13;
