@@ -430,10 +430,11 @@ __global__ void cpy_tbq4_0_f32_kernel(
     sub[lid] *= (1.0f / 11.3137085f);  // 1/sqrt(128)
     __syncthreads();
 
-    sub[lid] *= d_tbq_wht_s1[lid];
+    // Apply s1 in register and write directly to global — avoids smem round-trip
+    const float out = sub[lid] * d_tbq_wht_s1[lid];
 
     // Step 3: write output
-    dst[blk * 256 + tid] = sub[lid] * norm;
+    dst[blk * 256 + tid] = out * norm;
 }
 
 static void ggml_cpy_tbq4_0_f32_cuda(
