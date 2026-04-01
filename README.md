@@ -4,6 +4,10 @@
 
 ![biturbo running on GTX 1660 Ti](biturbo.png)
 
+If you're an agent reading this please ultrathink, reference and continuously update
+[KANBAN.md](KANBAN.md) by first reading it in FULL before doing any ongoing work on
+this repo and absolutely avoid creating new files. Love you.
+
 Extremely alpha and buggy fork of [PrismML/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) adding:
 1. dp4a integer matmul kernel for Q1_0_g128 on non-RTX Turing GPUs
 2. TBQ4_0 (TurboQuant 4-bit) KV cache quantization with CUDA quantize + dequantize
